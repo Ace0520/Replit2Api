@@ -340,6 +340,17 @@ function writeAndFlush(res: Response, data: string) {
   (res as unknown as { flush?: () => void }).flush?.();
 }
 
+// Map Anthropic stop_reason to OpenAI finish_reason
+function mapStopReason(reason: string | null | undefined): string {
+  switch (reason) {
+    case "end_turn":      return "stop";
+    case "tool_use":      return "tool_calls";
+    case "max_tokens":    return "length";
+    case "stop_sequence": return "stop";
+    default:              return "stop";
+  }
+}
+
 function requireApiKey(req: Request, res: Response, next: () => void) {
   const proxyKey = process.env.PROXY_API_KEY;
   if (!proxyKey) {
@@ -445,7 +456,9 @@ function convertContentForClaude(content: string | OAIContentPart[] | null | und
     if (part.type === "image_url") {
       const url = (part as { type: "image_url"; image_url: { url: string } }).image_url.url;
       if (url.startsWith("data:")) {
-        const [header, data] = url.split(",");
+        const commaIdx = url.indexOf(",");
+        const header = url.substring(0, commaIdx);
+        const data = url.substring(commaIdx + 1);
         const media_type = header.replace("data:", "").replace(";base64", "");
         return { type: "image", source: { type: "base64", media_type, data } };
       } else {
@@ -535,6 +548,12 @@ function convertMessagesForClaude(messages: OAIMessage[]): AnthropicMessage[] {
     } else {
       result.push(msg);
     }
+  }
+
+  // Fallback: if only system messages were present, add an empty user message
+  // to satisfy Anthropic's requirement of at least one user/assistant message.
+  if (result.length === 0) {
+    result.push({ role: "user", content: "" });
   }
 
   return result;
@@ -733,10 +752,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
     } as Parameters<typeof client.messages.create>[0];
 
     if (shouldStream) {
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
-      res.setHeader("X-Accel-Buffering", "no");
+      setSseHeaders(res);
 
       const keepalive = setInterval(() => {
         if (!res.writableEnded) writeAndFlush(res, ": keepalive\n\n");
@@ -750,6 +766,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
         const claudeStream = client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]);
 
         for await (const event of claudeStream) {
+          if (res.writableEnded) break;
           if (event.type === "message_start") {
             inputTokens = event.message.usage.input_tokens;
           } else if (event.type === "message_delta") {
@@ -757,8 +774,7 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
           }
           writeAndFlush(res, `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
         }
-        writeAndFlush(res, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-        res.end();
+        if (!res.writableEnded) res.end();
         recordCallStat("local", Date.now() - startTime, inputTokens, outputTokens);
       } finally {
         clearInterval(keepalive);
@@ -1204,6 +1220,7 @@ async function handleClaude({
 
       let inputTokens = 0;
       let outputTokens = 0;
+      let cachedTokens = 0;
       let thinkingStarted = false;
       let ttftMs: number | undefined;
       // Track current tool_use block index for streaming
@@ -1214,6 +1231,7 @@ async function handleClaude({
       for await (const event of claudeStream) {
         if (event.type === "message_start") {
           inputTokens = event.message.usage.input_tokens;
+          cachedTokens = (event.message.usage as Record<string, number>).cache_read_input_tokens ?? 0;
           writeAndFlush(res, `data: ${JSON.stringify({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
 
         } else if (event.type === "content_block_start") {
@@ -1264,8 +1282,8 @@ async function handleClaude({
           }
           outputTokens = event.usage.output_tokens;
           const stopReason = event.delta.stop_reason;
-          const finishReason = stopReason === "tool_use" ? "tool_calls" : (stopReason ?? "stop");
-          writeAndFlush(res, `data: ${JSON.stringify({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens } })}\n\n`);
+          const finishReason = mapStopReason(stopReason);
+          writeAndFlush(res, `data: ${JSON.stringify({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: finishReason }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, ...(cachedTokens > 0 ? { prompt_tokens_details: { cached_tokens: cachedTokens } } : {}) } })}\n\n`);
         }
       }
 
@@ -1303,7 +1321,7 @@ async function handleClaude({
 
     const text = textParts.join("\n\n");
     const stopReason = result.stop_reason;
-    const finishReason = stopReason === "tool_use" ? "tool_calls" : (stopReason ?? "stop");
+    const finishReason = mapStopReason(stopReason);
 
     res.json({
       id: result.id,
@@ -1323,6 +1341,7 @@ async function handleClaude({
         prompt_tokens: result.usage.input_tokens,
         completion_tokens: result.usage.output_tokens,
         total_tokens: result.usage.input_tokens + result.usage.output_tokens,
+        ...((result.usage as Record<string, number>).cache_read_input_tokens > 0 ? { prompt_tokens_details: { cached_tokens: (result.usage as Record<string, number>).cache_read_input_tokens } } : {}),
       },
     });
     return { promptTokens: result.usage.input_tokens, completionTokens: result.usage.output_tokens };
