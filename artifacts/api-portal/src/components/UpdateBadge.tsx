@@ -16,12 +16,16 @@ interface Props {
   apiKey: string;
 }
 
-export default function UpdateBadge({ baseUrl, apiKey: _apiKey }: Props) {
+export default function UpdateBadge({ baseUrl, apiKey }: Props) {
   const [info, setInfo] = useState<VersionInfo | null>(null);
   const [open, setOpen] = useState(false);
   const [checking, setChecking] = useState(false);
   const [checkDone, setCheckDone] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [updateMsg, setUpdateMsg] = useState<string | null>(null);
+  const [updateErr, setUpdateErr] = useState<string | null>(null);
+  const [countdown, setCountdown] = useState<number | null>(null);
 
   const fetchVersion = useCallback(async () => {
     try {
@@ -47,6 +51,39 @@ export default function UpdateBadge({ baseUrl, apiKey: _apiKey }: Props) {
     const t = setInterval(fetchVersion, 5 * 60 * 1000);
     return () => clearInterval(t);
   }, [fetchVersion]);
+
+  // Auto-refresh countdown after update
+  useEffect(() => {
+    if (countdown === null || countdown <= 0) return;
+    const t = setTimeout(() => {
+      if (countdown <= 1) { window.location.reload(); return; }
+      setCountdown(countdown - 1);
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [countdown]);
+
+  const applyUpdate = async () => {
+    setUpdating(true);
+    setUpdateMsg(null);
+    setUpdateErr(null);
+    try {
+      const r = await fetch(`${baseUrl}/api/update/apply`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      });
+      const data = await r.json();
+      if (r.ok) {
+        setUpdateMsg(data.message || "更新已启动，服务器将自动重启...");
+        setCountdown(30);
+      } else {
+        setUpdateErr(data.error || `更新失败: HTTP ${r.status}`);
+        setUpdating(false);
+      }
+    } catch (e) {
+      setUpdateErr(e instanceof Error ? e.message : "网络错误");
+      setUpdating(false);
+    }
+  };
 
   const buildAgentPrompt = (latestVer: string) =>
     `请帮我把 AI 网关更新到最新版本 ${latestVer}。\n` +
@@ -174,12 +211,55 @@ export default function UpdateBadge({ baseUrl, apiKey: _apiKey }: Props) {
                   )}
                 </div>
 
+                {/* One-click update */}
+                {updateMsg ? (
+                  <div style={{
+                    background: "rgba(74,222,128,0.08)", border: "1px solid rgba(74,222,128,0.25)",
+                    borderRadius: "10px", padding: "14px", marginBottom: "14px",
+                    color: "#86efac", fontSize: "13px", lineHeight: "1.6",
+                  }}>
+                    <div style={{ fontWeight: 700, marginBottom: "6px" }}>✓ {updateMsg}</div>
+                    {countdown !== null && countdown > 0 && (
+                      <div style={{ color: "#4ade80", fontSize: "12px" }}>
+                        页面将在 {countdown} 秒后自动刷新...
+                      </div>
+                    )}
+                  </div>
+                ) : updateErr ? (
+                  <div style={{
+                    background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.15)",
+                    borderRadius: "10px", padding: "12px 14px", marginBottom: "14px",
+                    color: "#f87171", fontSize: "12.5px",
+                  }}>
+                    更新失败：{updateErr}
+                  </div>
+                ) : null}
+
+                {!updateMsg && (
+                  <button
+                    onClick={applyUpdate}
+                    disabled={updating}
+                    style={{
+                      width: "100%", padding: "11px 0", borderRadius: "8px", marginBottom: "14px",
+                      border: "1px solid rgba(99,102,241,0.5)",
+                      background: updating ? "rgba(99,102,241,0.08)" : "rgba(99,102,241,0.2)",
+                      color: updating ? "#6366f1" : "#a5b4fc",
+                      fontSize: "13.5px", fontWeight: 700,
+                      cursor: updating ? "not-allowed" : "pointer", transition: "all 0.2s",
+                      display: "flex", alignItems: "center", justifyContent: "center", gap: "8px",
+                    }}
+                  >
+                    {updating && <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⟳</span>}
+                    {updating ? "正在更新..." : "一键更新"}
+                  </button>
+                )}
+
                 <div style={{
                   background: "rgba(99,102,241,0.06)", border: "1px solid rgba(99,102,241,0.18)",
                   borderRadius: "10px", padding: "14px", marginBottom: "14px",
                 }}>
                   <div style={{ color: "#818cf8", fontSize: "11px", fontWeight: 700, marginBottom: "10px" }}>
-                    📋 更新方式 — 复制提示词 → 粘贴到 Replit AI 对话框
+                    📋 备选方式 — 复制提示词 → 粘贴到 Replit AI 对话框
                   </div>
                   <pre style={{
                     margin: 0, padding: "10px 12px",
