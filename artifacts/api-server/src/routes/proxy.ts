@@ -469,8 +469,10 @@ function convertToolsForClaude(tools: OAITool[]): { name: string; description: s
 }
 
 // Convert OpenAI messages (incl. tool_calls / tool roles) → Anthropic messages
+// IMPORTANT: Anthropic requires strict alternating user/assistant roles.
+// Multiple consecutive same-role messages (especially tool results) must be merged.
 function convertMessagesForClaude(messages: OAIMessage[]): AnthropicMessage[] {
-  const result: AnthropicMessage[] = [];
+  const raw: AnthropicMessage[] = [];
 
   for (const msg of messages) {
     if (msg.role === "system") continue; // handled as top-level system param
@@ -494,9 +496,9 @@ function convertMessagesForClaude(messages: OAIMessage[]): AnthropicMessage[] {
           try { input = JSON.parse(tc.function.arguments); } catch {}
           parts.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
         }
-        result.push({ role: "assistant", content: parts });
+        raw.push({ role: "assistant", content: parts });
       } else {
-        result.push({
+        raw.push({
           role: "assistant",
           content: convertContentForClaude(assistantMsg.content as string | OAIContentPart[]),
         });
@@ -504,16 +506,34 @@ function convertMessagesForClaude(messages: OAIMessage[]): AnthropicMessage[] {
     } else if (msg.role === "tool") {
       // Tool results → Anthropic user message with tool_result
       const toolMsg = msg as Extract<OAIMessage, { role: "tool" }>;
-      result.push({
+      raw.push({
         role: "user",
         content: [{ type: "tool_result", tool_use_id: toolMsg.tool_call_id, content: toolMsg.content }],
       });
     } else {
       // user (and any other role)
-      result.push({
+      raw.push({
         role: "user",
         content: convertContentForClaude(msg.content as string | OAIContentPart[]),
       });
+    }
+  }
+
+  // Merge consecutive same-role messages (critical for tool_result sequences)
+  const result: AnthropicMessage[] = [];
+  for (const msg of raw) {
+    const prev = result[result.length - 1];
+    if (prev && prev.role === msg.role) {
+      // Convert both to arrays and merge
+      const prevParts: AnthropicContentPart[] = typeof prev.content === "string"
+        ? [{ type: "text", text: prev.content }]
+        : prev.content as AnthropicContentPart[];
+      const curParts: AnthropicContentPart[] = typeof msg.content === "string"
+        ? [{ type: "text", text: msg.content }]
+        : msg.content as AnthropicContentPart[];
+      prev.content = [...prevParts, ...curParts];
+    } else {
+      result.push(msg);
     }
   }
 
@@ -570,7 +590,7 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
             ? selectedModel.replace(/-thinking$/, "")
             : selectedModel;
         const CLAUDE_MODEL_MAX: Record<string, number> = {
-          "claude-haiku-4-5": 8096,
+          "claude-haiku-4-5": 8192,
           "claude-sonnet-4-5": 64000,
           "claude-sonnet-4-6": 64000,
           "claude-opus-4-1": 64000,
@@ -581,6 +601,12 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
         const defaultMaxTokens = thinkingEnabled ? Math.max(modelMax, 32000) : modelMax;
         const client = makeLocalAnthropic();
         result = await handleClaude({ req, res, client, model: actualModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens ?? defaultMaxTokens, thinking: thinkingEnabled, tools, toolChoice: tool_choice, startTime });
+      } else if (MODEL_PROVIDER_MAP.get(selectedModel) === "gemini" || MODEL_PROVIDER_MAP.get(selectedModel) === "openrouter" || selectedModel.includes("/")) {
+        // Gemini and OpenRouter models cannot be served locally — require a friend proxy node
+        if (!res.headersSent) {
+          res.status(502).json({ error: { message: `Model '${selectedModel}' requires a sub-node (friend proxy) to serve. No available sub-node was found. Please add a friend proxy that supports this model.`, type: "invalid_request_error", code: "model_not_available_locally" } });
+        }
+        break;
       } else {
         const client = makeLocalOpenAI();
         result = await handleOpenAI({ req, res, client, model: selectedModel, messages: finalMessages, stream: shouldStream, maxTokens: max_tokens, tools, toolChoice: tool_choice, startTime });
@@ -629,6 +655,37 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
 // Accepts Anthropic API format directly (for clients like Cherry Studio, Claude.ai compatible tools)
 // ---------------------------------------------------------------------------
 
+// Whitelist of allowed top-level params for Anthropic Messages API.
+// Prevents Vertex AI / third-party client fields (output_config, context_management, betas, etc.)
+// from being passed through and causing 400 errors.
+const ANTHROPIC_ALLOWED_PARAMS = new Set([
+  "model", "messages", "system", "stream", "max_tokens",
+  "temperature", "top_p", "top_k", "stop_sequences",
+  "thinking", "tools", "tool_choice", "metadata",
+]);
+
+// Recursively clean cache_control objects: remove fields not supported by Anthropic
+// (e.g. scope, ttl added by Vertex AI clients). Keep only type: "ephemeral" etc.
+function cleanCacheControl(obj: unknown): unknown {
+  if (obj === null || obj === undefined || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(cleanCacheControl);
+
+  const record = obj as Record<string, unknown>;
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (key === "cache_control" && value && typeof value === "object") {
+      // Only keep "type" from cache_control, strip scope/ttl/etc.
+      const cc = value as Record<string, unknown>;
+      const safe: Record<string, unknown> = {};
+      if (cc.type) safe.type = cc.type;
+      cleaned[key] = safe;
+    } else {
+      cleaned[key] = cleanCacheControl(value);
+    }
+  }
+  return cleaned;
+}
+
 router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) => {
   const body = req.body as {
     model?: string;
@@ -641,7 +698,15 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
     [key: string]: unknown;
   };
 
-  const { model, messages, system, stream, max_tokens, ...rest } = body;
+  const { model, messages, system, stream, max_tokens } = body;
+  // Only pass through whitelisted extra params
+  const extraParams: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (!["model", "messages", "system", "stream", "max_tokens"].includes(key) && ANTHROPIC_ALLOWED_PARAMS.has(key)) {
+      extraParams[key] = value;
+    }
+  }
+
   const selectedModel = model ?? "claude-sonnet-4-5";
   const maxTokens = max_tokens ?? 4096;
   const shouldStream = stream ?? false;
@@ -652,12 +717,16 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   try {
     const client = makeLocalAnthropic();
 
+    // Clean cache_control in system and messages to strip unsupported fields
+    const cleanedSystem = system ? cleanCacheControl(system) : undefined;
+    const cleanedMessages = cleanCacheControl(messages) as AnthropicMessage[];
+
     const createParams = {
       model: selectedModel,
       max_tokens: maxTokens,
-      messages,
-      ...(system ? { system } : {}),
-      ...rest,
+      messages: cleanedMessages,
+      ...(cleanedSystem ? { system: cleanedSystem } : {}),
+      ...extraParams,
     } as Parameters<typeof client.messages.create>[0];
 
     if (shouldStream) {
@@ -692,7 +761,8 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
         clearInterval(keepalive);
       }
     } else {
-      const result = await client.messages.create(createParams);
+      // Internally use stream().finalMessage() to avoid Replit's 10-min request timeout
+      const result = await client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]).finalMessage();
       const usage = (result as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
       recordCallStat("local", Date.now() - startTime, usage.input_tokens ?? 0, usage.output_tokens ?? 0);
       res.json(result);
@@ -1167,6 +1237,11 @@ async function handleClaude({
           }
 
         } else if (event.type === "message_delta") {
+          // Close any unclosed thinking block before emitting finish
+          if (thinkingStarted) {
+            writeAndFlush(res, `data: ${JSON.stringify({ id: msgId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta: { content: "\n</thinking>\n\n" }, finish_reason: null }] })}\n\n`);
+            thinkingStarted = false;
+          }
           outputTokens = event.usage.output_tokens;
           const stopReason = event.delta.stop_reason;
           const finishReason = stopReason === "tool_use" ? "tool_calls" : (stopReason ?? "stop");
@@ -1182,8 +1257,8 @@ async function handleClaude({
     }
 
   } else {
-    // Non-streaming
-    const result = await client.messages.create(buildCreateParams() as Parameters<typeof client.messages.create>[0]);
+    // Non-streaming — internally use stream().finalMessage() to avoid Replit's 10-min timeout
+    const result = await client.messages.stream(buildCreateParams() as Parameters<typeof client.messages.stream>[0]).finalMessage();
 
     const textParts: string[] = [];
     const toolCalls: OAIToolCall[] = [];
