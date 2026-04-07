@@ -639,12 +639,15 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
 
       req.log.error({ err }, "Proxy request failed");
       if (!res.headersSent) {
+        // No response started yet — send a plain HTTP 500
         res.status(500).json({ error: { message: errMsg || "Unknown error", type: "server_error" } });
-      } else {
+      } else if (!res.writableEnded) {
+        // SSE headers sent but stream not yet closed (e.g. network error mid-stream)
         writeAndFlush(res, `data: ${JSON.stringify({ error: { message: errMsg || "Unknown error" } })}\n\n`);
         writeAndFlush(res, "data: [DONE]\n\n");
         res.end();
       }
+      // else: response already fully ended (handleFriendProxy closed it) — nothing to do
       break;
     }
   }
@@ -958,28 +961,65 @@ async function handleFriendProxy({
   if (tools?.length) body["tools"] = tools;
   if (toolChoice !== undefined) body["tool_choice"] = toolChoice;
 
-  const fetchRes = await fetch(`${backend.url}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${backend.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120_000),
-  });
-
-  if (!fetchRes.ok) {
-    const errText = await fetchRes.text().catch(() => "unknown");
-    throw new FriendProxyHttpError(fetchRes.status, `Friend proxy error ${fetchRes.status}: ${errText}`);
+  // ── Non-streaming ────────────────────────────────────────────────────────
+  // Handled first so the streaming path below can return early with clear flow.
+  if (!stream) {
+    const fetchRes = await fetch(`${backend.url}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!fetchRes.ok) {
+      const errText = await fetchRes.text().catch(() => "unknown");
+      throw new FriendProxyHttpError(fetchRes.status, `Friend proxy error ${fetchRes.status}: ${errText}`);
+    }
+    const json = await fetchRes.json() as Record<string, unknown>;
+    res.json(json);
+    const usage = json["usage"] as { prompt_tokens?: number; completion_tokens?: number } | null | undefined;
+    if ((usage?.prompt_tokens ?? 0) === 0) {
+      const inputChars = messages.reduce((acc, m) => {
+        if (typeof m.content === "string") return acc + m.content.length;
+        if (Array.isArray(m.content))
+          return acc + (m.content as Array<{ type: string; text?: string }>)
+            .filter((p) => p.type === "text").reduce((a, p) => a + (p.text?.length ?? 0), 0);
+        return acc;
+      }, 0);
+      const outputChars = (json["choices"] as Array<{ message?: { content?: string } }>)?.[0]?.message?.content?.length ?? 0;
+      return { promptTokens: Math.ceil(inputChars / 4), completionTokens: Math.ceil(outputChars / 4) };
+    }
+    return { promptTokens: usage?.prompt_tokens ?? 0, completionTokens: usage?.completion_tokens ?? 0 };
   }
 
   // ── Streaming ────────────────────────────────────────────────────────────
-  if (stream) {
-    let promptTokens = 0;
-    let completionTokens = 0;
-    let ttftMs: number | undefined;
-    let outputChars = 0;
-    let headersCommitted = false;
+  // Immediately commit SSE headers so the client (SillyTavern, etc.) receives an
+  // HTTP response right away and does NOT time out before the upstream responds.
+  // A keepalive comment is written every 3 s to prevent intermediate proxies or
+  // clients from closing the connection while waiting for the first real chunk.
+  setSseHeaders(res);
+  const keepaliveTimer = setInterval(() => writeAndFlush(res, ": keep-alive\n\n"), 3000);
+
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let ttftMs: number | undefined;
+  let outputChars = 0;
+
+  try {
+    const fetchRes = await fetch(`${backend.url}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    });
+
+    if (!fetchRes.ok) {
+      const errText = await fetchRes.text().catch(() => "unknown");
+      // Headers already sent — report error inside the SSE stream then close.
+      writeAndFlush(res, `data: ${JSON.stringify({ error: { message: `Friend proxy error ${fetchRes.status}: ${errText}`, type: "server_error" } })}\n\n`);
+      writeAndFlush(res, "data: [DONE]\n\n");
+      res.end();
+      throw new FriendProxyHttpError(fetchRes.status, `Friend proxy error ${fetchRes.status}: ${errText}`);
+    }
 
     const reader = fetchRes.body!.getReader();
     const decoder = new TextDecoder();
@@ -989,10 +1029,6 @@ async function handleFriendProxy({
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
-        // Delay committing SSE headers until first chunk — preserves retry window
-        if (!headersCommitted) { setSseHeaders(res); headersCommitted = true; }
-
         buf += decoder.decode(value, { stream: true });
         const lines = buf.split("\n");
         buf = lines.pop() ?? "";
@@ -1023,31 +1059,14 @@ async function handleFriendProxy({
     } finally {
       reader.releaseLock();
     }
-
-    if (!headersCommitted) throw new Error("upstream closed before first payload (empty body)");
-    res.end();
-
-    // Fallback: estimate tokens from char count when sub-node didn't return usage
-    if (promptTokens === 0) {
-      const inputChars = messages.reduce((acc, m) => {
-        if (typeof m.content === "string") return acc + m.content.length;
-        if (Array.isArray(m.content))
-          return acc + (m.content as Array<{ type: string; text?: string }>)
-            .filter((p) => p.type === "text").reduce((a, p) => a + (p.text?.length ?? 0), 0);
-        return acc;
-      }, 0);
-      promptTokens = Math.ceil(inputChars / 4);
-      completionTokens = Math.ceil(outputChars / 4);
-    }
-
-    return { promptTokens, completionTokens, ttftMs };
+  } finally {
+    clearInterval(keepaliveTimer);
   }
 
-  // ── Non-streaming ────────────────────────────────────────────────────────
-  const json = await fetchRes.json() as Record<string, unknown>;
-  res.json(json);
-  const usage = json["usage"] as { prompt_tokens?: number; completion_tokens?: number } | null | undefined;
-  if ((usage?.prompt_tokens ?? 0) === 0) {
+  res.end();
+
+  // Fallback: estimate tokens from char count when sub-node didn't return usage
+  if (promptTokens === 0) {
     const inputChars = messages.reduce((acc, m) => {
       if (typeof m.content === "string") return acc + m.content.length;
       if (Array.isArray(m.content))
@@ -1055,10 +1074,11 @@ async function handleFriendProxy({
           .filter((p) => p.type === "text").reduce((a, p) => a + (p.text?.length ?? 0), 0);
       return acc;
     }, 0);
-    const outputChars = (json["choices"] as Array<{ message?: { content?: string } }>)?.[0]?.message?.content?.length ?? 0;
-    return { promptTokens: Math.ceil(inputChars / 4), completionTokens: Math.ceil(outputChars / 4) };
+    promptTokens = Math.ceil(inputChars / 4);
+    completionTokens = Math.ceil(outputChars / 4);
   }
-  return { promptTokens: usage?.prompt_tokens ?? 0, completionTokens: usage?.completion_tokens ?? 0 };
+
+  return { promptTokens, completionTokens, ttftMs };
 }
 
 async function handleOpenAI({
