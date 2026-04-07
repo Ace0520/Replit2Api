@@ -20,7 +20,7 @@ const WORKSPACE_ROOT = resolve(process.cwd(), "../../");
 // GitHub config — set UPDATE_CHECK_URL to GITHUB_RAW_VERSION_URL on sub-nodes
 // ---------------------------------------------------------------------------
 
-const GITHUB_OWNER = "Akatsuki03";
+const GITHUB_OWNER = "Ace0520";
 const GITHUB_REPO  = "Replit2Api";
 const GITHUB_BRANCH = "main";
 const GITHUB_API  = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;

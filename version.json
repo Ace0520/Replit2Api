@@ -1,6 +1,6 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "Replit2Api",
-  "releaseDate": "2026-04-06",
-  "releaseNotes": "v1.1.0 — Friend proxy retry loop (up to 3 times, auto-skip failed nodes); FriendProxyHttpError distinguishes 5xx vs network; SSE headers delayed to first chunk; token fallback estimation"
+  "releaseDate": "2026-04-07",
+  "releaseNotes": "v1.2.0 — Fix consecutive tool_result merge (Claude Code multi-tool); non-streaming uses stream().finalMessage() to prevent Replit 10-min timeout; parameter whitelist + cache_control cleanup for /v1/messages; Gemini/OpenRouter local 502 error; claude-haiku-4-5 max_tokens fix; thinking closing tag fix; auto-update points to Ace0520 repo"
 }
