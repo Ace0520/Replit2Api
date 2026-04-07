@@ -6,7 +6,7 @@
 >
 > 一个 Replit 项目，统一接入主流 AI 服务商，提供 OpenAI 兼容接口。
 
-[![Version](https://img.shields.io/badge/version-1.2.0-6366f1?style=flat-square)](./version.json)
+[![Version](https://img.shields.io/badge/version-1.2.1-6366f1?style=flat-square)](./version.json)
 [![Replit](https://img.shields.io/badge/Replit-Remix%20now-f26207?style=flat-square&logo=replit)](https://replit.com/@1400747468/Replit2Api)
 [![License](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)](./LICENSE)
 [![Forked from](https://img.shields.io/badge/forked%20from-Akatsuki03%2FReplit2Api-8b5cf6?style=flat-square&logo=github)](https://github.com/Akatsuki03/Replit2Api)
@@ -296,6 +296,24 @@ Manage multiple Replit2Api instances from the **Stats & Nodes** tab:
 ---
 
 ## 更新日志 · Changelog
+
+### v1.2.1 — 2026-04-07
+
+- **修复重复 message_stop**：删除手动追加的 `message_stop` 事件，修复客户端 "Received message_stop without a current message" 报错
+- **完善 stop_reason 映射**：`end_turn→stop`、`max_tokens→length`、`stop_sequence→stop`，符合 OpenAI 规范
+- **system-only 消息兜底**：仅有 system 消息时自动追加空 user 消息，避免 Anthropic 400 报错
+- **流式写入安全守卫**：`/v1/messages` 写入前检查 `writableEnded`，防止客户端断连后崩溃
+- **Cache token 统计**：usage 中暴露 `prompt_tokens_details.cached_tokens`
+- **SSE headers 统一**：`/v1/messages` 复用 `setSseHeaders()`，补齐 `flushHeaders()` 和 CORS
+- **base64 解析防御**：data URL 改用 `indexOf` + `substring` 替代 `split`
+
+- **Fix duplicate message_stop**: remove redundant manual `message_stop` event, fix client SDK error
+- **Complete stop_reason mapping**: `end_turn→stop`, `max_tokens→length`, `stop_sequence→stop` per OpenAI spec
+- **System-only messages fallback**: auto-append empty user message to prevent Anthropic 400
+- **Stream write safety guard**: check `writableEnded` before writes in `/v1/messages` to prevent crashes on client disconnect
+- **Cache token stats**: expose `prompt_tokens_details.cached_tokens` in usage
+- **SSE headers consistency**: `/v1/messages` reuses `setSseHeaders()` with `flushHeaders()` and CORS
+- **Defensive base64 parsing**: use `indexOf` + `substring` instead of `split` for data URLs
 
 ### v1.2.0 — 2026-04-07 (Fork)
 

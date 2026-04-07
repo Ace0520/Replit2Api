@@ -1,6 +1,6 @@
 {
-  "version": "1.2.0",
+  "version": "1.2.1",
   "name": "Replit2Api",
   "releaseDate": "2026-04-07",
-  "releaseNotes": "v1.2.0 — Fix consecutive tool_result merge (Claude Code multi-tool); non-streaming uses stream().finalMessage() to prevent Replit 10-min timeout; parameter whitelist + cache_control cleanup for /v1/messages; Gemini/OpenRouter local 502 error; claude-haiku-4-5 max_tokens fix; thinking closing tag fix; auto-update points to Ace0520 repo"
+  "releaseNotes": "v1.2.1 — Fix duplicate message_stop causing client SDK error; complete stop_reason→finish_reason mapping (end_turn/max_tokens/stop_sequence); system-only messages fallback; writableEnded guard for /v1/messages streaming; cache token stats (prompt_tokens_details); SSE headers consistency; defensive base64 data URL parsing"
 }
