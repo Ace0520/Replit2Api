@@ -9,6 +9,26 @@
 [![Version](https://img.shields.io/badge/version-1.2.0-6366f1?style=flat-square)](./version.json)
 [![Replit](https://img.shields.io/badge/Replit-Remix%20now-f26207?style=flat-square&logo=replit)](https://replit.com/@1400747468/Replit2Api)
 [![License](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)](./LICENSE)
+[![Forked from](https://img.shields.io/badge/forked%20from-Akatsuki03%2FReplit2Api-8b5cf6?style=flat-square&logo=github)](https://github.com/Akatsuki03/Replit2Api)
+
+> 🔱 **复刻自 / Forked from**: [Akatsuki03/Replit2Api](https://github.com/Akatsuki03/Replit2Api)（原版 Replit 模板：[@Akatsukis036s/Replit-Api-Public](https://replit.com/@Akatsukis036s/Replit-Api-Public)）
+>
+> 本仓库在原版基础上修复了多个关键 Bug 并增强了稳定性，详见下方改进列表。
+> This fork fixes several critical bugs and improves stability. See improvements below.
+
+### 🔧 相比原版的改进 · Improvements over upstream
+
+| # | 改进 · Improvement | 说明 · Description |
+|---|--------------------|--------------------|
+| 1 | **连续 tool_result 消息合并** | 修复 Claude Code 多工具调用场景下，连续 `role:"tool"` 消息未合并导致 Anthropic API 400 报错。Fix: merge consecutive same-role messages to satisfy Anthropic's strict alternating user/assistant requirement. |
+| 2 | **非流式请求防超时** | 所有非流式 Claude 请求改用 `stream().finalMessage()` 内部走流式，防止 Replit 10 分钟请求超时。Fix: non-streaming Claude requests now use internal streaming to avoid Replit's 10-min timeout. |
+| 3 | **Anthropic 参数白名单** | `/v1/messages` 端点添加参数白名单，过滤 `output_config`、`context_management`、`betas` 等第三方客户端透传的无效字段。Add parameter whitelist to block unsupported fields from third-party clients. |
+| 4 | **cache_control 递归清理** | 递归清理 `system` 和 `messages` 中 `cache_control` 对象的 `scope`、`ttl` 等 Vertex AI 不支持字段。Recursively strip unsupported `cache_control` sub-fields (scope, ttl). |
+| 5 | **Gemini/OpenRouter 本地节点明确报错** | 当 Gemini/OpenRouter 模型无可用子节点时，返回 502 明确错误，而非静默走 OpenAI 报 "model not found"。Return clear 502 error instead of silently failing. |
+| 6 | **claude-haiku-4-5 max_tokens 修正** | 从 8096（笔误）修正为 8192。Fix typo: 8096 → 8192. |
+| 7 | **thinking 流式闭合标签** | 修复思考模式流式输出中，`</thinking>` 闭合标签可能缺失的问题。Fix: ensure `</thinking>` closing tag is always emitted in streaming. |
+| 8 | **Friend Proxy 流式立即发 SSE headers** | 流式请求立即发送 SSE headers + 3s keepalive 心跳，防止客户端在等待上游响应时超时。Immediately send SSE headers + keepalive to prevent client timeouts. |
+| 9 | **错误处理 writableEnded 检查** | 防止向已关闭的响应流写入导致崩溃。Prevent writing to already-closed response streams. |
 
 ---
 
@@ -276,6 +296,26 @@ Manage multiple Replit2Api instances from the **Stats & Nodes** tab:
 ---
 
 ## 更新日志 · Changelog
+
+### v1.2.0 — 2026-04-07 (Fork)
+
+- **连续 tool_result 消息合并**：修复 Claude Code 多工具调用时 Anthropic 400 报错
+- **非流式 Claude 防超时**：改用 `stream().finalMessage()` 绕过 Replit 10 分钟限制
+- **Anthropic 参数白名单 + cache_control 递归清理**：防止第三方客户端透传无效字段
+- **Gemini/OpenRouter 本地 502 明确错误**：替代静默失败
+- **claude-haiku-4-5 max_tokens**：8096 → 8192
+- **thinking 流式闭合标签**：确保 `</thinking>` 始终输出
+- **自动更新指向本仓库**（Ace0520/Replit2Api）
+
+- **Consecutive tool_result merge**: fix Anthropic 400 error in Claude Code multi-tool scenarios
+- **Non-streaming Claude timeout fix**: use `stream().finalMessage()` to bypass Replit 10-min limit
+- **Anthropic param whitelist + cache_control cleanup**: block unsupported fields from third-party clients
+- **Gemini/OpenRouter local 502 error**: clear error instead of silent failure
+- **claude-haiku-4-5 max_tokens**: 8096 → 8192
+- **thinking stream closing tag**: ensure `</thinking>` is always emitted
+- **Auto-update now points to this repo** (Ace0520/Replit2Api)
+
+---
 
 ### v1.1.0 — 2026-04-06
 
