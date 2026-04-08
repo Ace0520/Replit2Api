@@ -775,6 +775,39 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
     const cleanedSystem = system ? cleanCacheControl(system) : undefined;
     const cleanedMessages = cleanCacheControl(messages) as AnthropicMessage[];
 
+    // Auto-inject cache_control for clients that don't send it (e.g. VSCode extensions).
+    // Mark system prompt + last 2 long turns for prompt caching to save tokens.
+    const hasAnyCacheControl = (obj: unknown): boolean => {
+      if (!obj || typeof obj !== "object") return false;
+      if (Array.isArray(obj)) return obj.some(hasAnyCacheControl);
+      const rec = obj as Record<string, unknown>;
+      if ("cache_control" in rec) return true;
+      return Object.values(rec).some(hasAnyCacheControl);
+    };
+    const needsAutoCache = !hasAnyCacheControl(cleanedSystem) && !hasAnyCacheControl(cleanedMessages);
+    if (needsAutoCache) {
+      // Tag system prompt
+      if (Array.isArray(cleanedSystem) && cleanedSystem.length > 0) {
+        const last = cleanedSystem[cleanedSystem.length - 1] as Record<string, unknown>;
+        last.cache_control = { type: "ephemeral" };
+      }
+      // Tag last 2 turns (user or assistant) in messages
+      let tagged = 0;
+      for (let i = cleanedMessages.length - 1; i >= 0 && tagged < 2; i--) {
+        const msg = cleanedMessages[i] as Record<string, unknown>;
+        if (msg.role === "user" || msg.role === "assistant") {
+          // If content is array of blocks, tag the last block
+          if (Array.isArray(msg.content) && msg.content.length > 0) {
+            (msg.content[msg.content.length - 1] as Record<string, unknown>).cache_control = { type: "ephemeral" };
+          } else if (typeof msg.content === "string") {
+            // Convert string to content block array so we can add cache_control
+            msg.content = [{ type: "text", text: msg.content, cache_control: { type: "ephemeral" } }];
+          }
+          tagged++;
+        }
+      }
+    }
+
     const createParams = {
       model: selectedModel,
       max_tokens: maxTokens,

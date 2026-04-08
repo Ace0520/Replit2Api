@@ -1,6 +1,6 @@
 {
-  "version": "1.2.2",
+  "version": "1.3.0",
   "name": "Replit2Api",
   "releaseDate": "2026-04-08",
-  "releaseNotes": "v1.2.2 — Fix non-streaming 502 timeout on Replit (HTTP keepalive for Claude/OpenAI/FriendProxy); SetupWizard aligned with upstream (4 providers + programmatic AI Integrations + in-wizard key input); api-server serves portal static files for single-port deployment"
+  "releaseNotes": "v1.3.0 — Auto prompt caching for all /v1/messages clients; Claude Code compatibility (AbortController, count_tokens endpoint, higher default max_tokens, expanded param whitelist); optional undici connection pooling; IPv4-first DNS"
 }
