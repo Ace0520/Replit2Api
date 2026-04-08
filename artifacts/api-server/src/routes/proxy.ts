@@ -265,6 +265,12 @@ function pickBackendExcluding(exclude: Set<string>): Backend | null {
 // Client factories
 // ---------------------------------------------------------------------------
 
+// Cached SDK clients — reuse TCP/TLS connections across requests
+let _cachedOpenAI: OpenAI | null = null;
+let _cachedOpenAIKey = "";
+let _cachedAnthropic: Anthropic | null = null;
+let _cachedAnthropicKey = "";
+
 function makeLocalOpenAI(): OpenAI {
   const apiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
   const baseURL = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL;
@@ -273,7 +279,11 @@ function makeLocalOpenAI(): OpenAI {
       "OpenAI integration is not configured. Please add the OpenAI integration in Replit (Tools → Integrations) to use GPT models."
     );
   }
-  return new OpenAI({ apiKey, baseURL });
+  const cacheKey = `${apiKey}|${baseURL}`;
+  if (_cachedOpenAI && _cachedOpenAIKey === cacheKey) return _cachedOpenAI;
+  _cachedOpenAI = new OpenAI({ apiKey, baseURL });
+  _cachedOpenAIKey = cacheKey;
+  return _cachedOpenAI;
 }
 
 function makeLocalAnthropic(): Anthropic {
@@ -284,7 +294,11 @@ function makeLocalAnthropic(): Anthropic {
       "Anthropic integration is not configured. Please add the Anthropic integration in Replit (Tools → Integrations) to use Claude models."
     );
   }
-  return new Anthropic({ apiKey, baseURL });
+  const cacheKey = `${apiKey}|${baseURL}`;
+  if (_cachedAnthropic && _cachedAnthropicKey === cacheKey) return _cachedAnthropic;
+  _cachedAnthropic = new Anthropic({ apiKey, baseURL });
+  _cachedAnthropicKey = cacheKey;
+  return _cachedAnthropic;
 }
 
 
@@ -638,14 +652,15 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
       recordErrorStat(backendLabel);
 
       const is5xx = err instanceof FriendProxyHttpError && err.status >= 500;
+      const is429 = err instanceof FriendProxyHttpError && err.status === 429;
       const errMsg = err instanceof Error ? err.message : "";
       const isNetworkErr = err instanceof TypeError
         || ["fetch", "aborted", "terminated", "closed", "upstream", "ECONNRESET", "socket hang up", "UND_ERR"]
           .some((kw) => errMsg.includes(kw));
 
-      if (backend.kind === "friend" && (is5xx || isNetworkErr)) {
+      if (backend.kind === "friend" && (is5xx || isNetworkErr || is429)) {
         setHealth(backend.url, false);
-        req.log.warn({ url: backend.url, attempt, is5xx, isNetworkErr }, "Friend backend marked unhealthy, considering retry");
+        req.log.warn({ url: backend.url, attempt, is5xx, is429, isNetworkErr }, "Friend backend marked unhealthy, considering retry");
 
         if (attempt < MAX_FRIEND_RETRIES && !res.headersSent) {
           const next = pickBackendExcluding(triedFriendUrls);
@@ -658,8 +673,10 @@ router.post("/v1/chat/completions", requireApiKey, async (req: Request, res: Res
 
       req.log.error({ err }, "Proxy request failed");
       if (!res.headersSent) {
-        // No response started yet — send a plain HTTP 500
-        res.status(500).json({ error: { message: errMsg || "Unknown error", type: "server_error" } });
+        // Pass through real status code (429, 400, 529, etc.) from upstream
+        const upstreamStatus = err instanceof FriendProxyHttpError ? err.status : (err as { status?: number }).status;
+        const statusCode = (typeof upstreamStatus === "number" && upstreamStatus >= 400) ? upstreamStatus : 500;
+        res.status(statusCode).json({ error: { message: errMsg || "Unknown error", type: statusCode === 429 ? "rate_limit_error" : "server_error" } });
       } else if (!res.writableEnded) {
         // SSE headers sent but stream not yet closed (e.g. network error mid-stream)
         writeAndFlush(res, `data: ${JSON.stringify({ error: { message: errMsg || "Unknown error" } })}\n\n`);
@@ -684,6 +701,8 @@ const ANTHROPIC_ALLOWED_PARAMS = new Set([
   "model", "messages", "system", "stream", "max_tokens",
   "temperature", "top_p", "top_k", "stop_sequences",
   "thinking", "tools", "tool_choice", "metadata",
+  // Claude Code / newer SDK fields
+  "service_tier", "betas",
 ]);
 
 // Recursively clean cache_control objects: remove fields not supported by Anthropic
@@ -730,11 +749,20 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   }
 
   const selectedModel = model ?? "claude-sonnet-4-5";
-  const maxTokens = max_tokens ?? 4096;
+  const hasThinking = extraParams.thinking && (extraParams.thinking as { type?: string }).type === "enabled";
+  // Claude Code sends large max_tokens; use a generous default when not provided.
+  // When thinking is enabled, Anthropic requires max_tokens >= budget_tokens.
+  const defaultMax = hasThinking ? 64000 : 16384;
+  const maxTokens = max_tokens ?? defaultMax;
   const shouldStream = stream ?? false;
   const startTime = Date.now();
 
   req.log.info({ model: selectedModel, stream: shouldStream }, "Anthropic /v1/messages request");
+
+  // AbortController lets us cancel the upstream SDK request when the client
+  // disconnects (e.g. Ctrl+C in Claude Code). This prevents wasting tokens.
+  const abortController = new AbortController();
+  req.on("close", () => abortController.abort());
 
   try {
     const client = makeLocalAnthropic();
@@ -765,6 +793,9 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
       try {
         const claudeStream = client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]);
 
+        // Abort the stream when the client disconnects
+        abortController.signal.addEventListener("abort", () => claudeStream.abort(), { once: true });
+
         for await (const event of claudeStream) {
           if (res.writableEnded) break;
           if (event.type === "message_start") {
@@ -788,7 +819,9 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
       }, 15_000);
       req.on("close", () => clearInterval(nsKeep));
       try {
-        const result = await client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]).finalMessage();
+        const streamRunner = client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]);
+        abortController.signal.addEventListener("abort", () => streamRunner.abort(), { once: true });
+        const result = await streamRunner.finalMessage();
         const usage = (result as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
         recordCallStat("local", Date.now() - startTime, usage.input_tokens ?? 0, usage.output_tokens ?? 0);
         res.end(JSON.stringify(result));
@@ -799,12 +832,33 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
   } catch (err: unknown) {
     recordErrorStat("local");
     req.log.error({ err }, "/v1/messages request failed");
+    // Extract real status code from Anthropic SDK errors (429, 400, 529, etc.)
+    const errStatus = (err as { status?: number }).status;
+    const statusCode = (typeof errStatus === "number" && errStatus >= 400) ? errStatus : 500;
+    const errMessage = err instanceof Error ? err.message : "Unknown error";
+    const errType = statusCode === 429 ? "rate_limit_error" : statusCode >= 500 ? "server_error" : "invalid_request_error";
     if (!res.headersSent) {
-      res.status(500).json({ error: { type: "server_error", message: err instanceof Error ? err.message : "Unknown error" } });
+      res.status(statusCode).json({ error: { type: errType, message: errMessage } });
     } else {
-      writeAndFlush(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", message: err instanceof Error ? err.message : "Unknown error" } })}\n\n`);
+      writeAndFlush(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: errType, message: errMessage } })}\n\n`);
       res.end();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Token counting endpoint for Claude Code
+// ---------------------------------------------------------------------------
+router.post("/v1/messages/count_tokens", requireApiKey, async (req: Request, res: Response) => {
+  try {
+    const client = makeLocalAnthropic();
+    const result = await client.messages.countTokens(req.body);
+    res.json(result);
+  } catch (err: unknown) {
+    const errStatus = (err as { status?: number }).status;
+    const statusCode = (typeof errStatus === "number" && errStatus >= 400) ? errStatus : 500;
+    const errMessage = err instanceof Error ? err.message : "Unknown error";
+    res.status(statusCode).json({ error: { type: "invalid_request_error", message: errMessage } });
   }
 });
 
@@ -1032,35 +1086,38 @@ async function handleFriendProxy({
   }
 
   // ── Streaming ────────────────────────────────────────────────────────────
-  // Immediately commit SSE headers so the client (SillyTavern, etc.) receives an
-  // HTTP response right away and does NOT time out before the upstream responds.
-  // A keepalive comment is written every 3 s to prevent intermediate proxies or
-  // clients from closing the connection while waiting for the first real chunk.
-  setSseHeaders(res);
-  const keepaliveTimer = setInterval(() => writeAndFlush(res, ": keep-alive\n\n"), 3000);
+  // Delay SSE header commitment until the upstream responds successfully.
+  // This preserves the retry window: if the upstream returns 4xx/5xx, we throw
+  // BEFORE committing headers so the retry loop can pick another friend node
+  // or return a proper HTTP error code to the client.
+  // Once the first successful chunk arrives, SSE headers are committed and a
+  // keepalive comment is written every 3 s to prevent intermediate proxies or
+  // clients from closing the connection.
 
   let promptTokens = 0;
   let completionTokens = 0;
   let ttftMs: number | undefined;
   let outputChars = 0;
 
+  // Phase 1: fetch — no SSE headers committed yet, retry is still possible
+  const fetchRes = await fetch(`${backend.url}/v1/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(600_000),
+  });
+
+  if (!fetchRes.ok) {
+    const errText = await fetchRes.text().catch(() => "unknown");
+    // Headers NOT sent yet — throw so the retry loop can handle it properly
+    throw new FriendProxyHttpError(fetchRes.status, `Friend proxy error ${fetchRes.status}: ${errText}`);
+  }
+
+  // Phase 2: upstream responded 200 — now commit SSE headers and stream chunks
+  setSseHeaders(res);
+  const keepaliveTimer = setInterval(() => writeAndFlush(res, ": keep-alive\n\n"), 3000);
+
   try {
-    const fetchRes = await fetch(`${backend.url}/v1/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(600_000),
-    });
-
-    if (!fetchRes.ok) {
-      const errText = await fetchRes.text().catch(() => "unknown");
-      // Headers already sent — report error inside the SSE stream then close.
-      writeAndFlush(res, `data: ${JSON.stringify({ error: { message: `Friend proxy error ${fetchRes.status}: ${errText}`, type: "server_error" } })}\n\n`);
-      writeAndFlush(res, "data: [DONE]\n\n");
-      res.end();
-      throw new FriendProxyHttpError(fetchRes.status, `Friend proxy error ${fetchRes.status}: ${errText}`);
-    }
-
     const reader = fetchRes.body!.getReader();
     const decoder = new TextDecoder();
     let buf = "";
