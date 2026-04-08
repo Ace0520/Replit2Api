@@ -27,7 +27,7 @@ initTheme();
 // Inner layout (needs AppState context)
 // ---------------------------------------------------------------------------
 function AppShell() {
-  const { baseUrl, apiKey, showWizard, setShowWizard } = useAppState();
+  const { baseUrl, apiKey, setApiKey, showWizard, setShowWizard } = useAppState();
 
   return (
     <SidebarProvider>
@@ -57,7 +57,7 @@ function AppShell() {
       {showWizard && (
         <SetupWizard
           baseUrl={baseUrl}
-          onComplete={() => { sessionStorage.setItem("wizard_dismissed", "1"); setShowWizard(false); }}
+          onComplete={(key) => { if (key) setApiKey(key); sessionStorage.setItem("wizard_dismissed", "1"); setShowWizard(false); }}
           onDismiss={() => { sessionStorage.setItem("wizard_dismissed", "1"); setShowWizard(false); }}
         />
       )}
