@@ -761,8 +761,12 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
 
   // AbortController lets us cancel the upstream SDK request when the client
   // disconnects (e.g. Ctrl+C in Claude Code). This prevents wasting tokens.
+  // NOTE: Use res.on("close") + writableFinished check — req.on("close") fires
+  // when the request body is fully received, NOT when the client disconnects.
   const abortController = new AbortController();
-  req.on("close", () => abortController.abort());
+  res.on("close", () => {
+    if (!res.writableFinished) abortController.abort();
+  });
 
   try {
     const client = makeLocalAnthropic();
