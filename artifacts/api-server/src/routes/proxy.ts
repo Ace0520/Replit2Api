@@ -780,11 +780,21 @@ router.post("/v1/messages", requireApiKey, async (req: Request, res: Response) =
         clearInterval(keepalive);
       }
     } else {
-      // Internally use stream().finalMessage() to avoid Replit's 10-min request timeout
-      const result = await client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]).finalMessage();
-      const usage = (result as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
-      recordCallStat("local", Date.now() - startTime, usage.input_tokens ?? 0, usage.output_tokens ?? 0);
-      res.json(result);
+      // Non-streaming — use internal streaming + HTTP keepalive to prevent Replit proxy 502 timeout.
+      res.setHeader("Content-Type", "application/json");
+      res.flushHeaders();
+      const nsKeep = setInterval(() => {
+        if (!res.writableEnded) res.write(" ");
+      }, 15_000);
+      req.on("close", () => clearInterval(nsKeep));
+      try {
+        const result = await client.messages.stream(createParams as Parameters<typeof client.messages.stream>[0]).finalMessage();
+        const usage = (result as { usage?: { input_tokens?: number; output_tokens?: number } }).usage ?? {};
+        recordCallStat("local", Date.now() - startTime, usage.input_tokens ?? 0, usage.output_tokens ?? 0);
+        res.end(JSON.stringify(result));
+      } finally {
+        clearInterval(nsKeep);
+      }
     }
   } catch (err: unknown) {
     recordErrorStat("local");
@@ -980,18 +990,32 @@ async function handleFriendProxy({
   // ── Non-streaming ────────────────────────────────────────────────────────
   // Handled first so the streaming path below can return early with clear flow.
   if (!stream) {
-    const fetchRes = await fetch(`${backend.url}/v1/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
-    });
+    // HTTP keepalive to prevent Replit proxy 502 timeout
+    res.setHeader("Content-Type", "application/json");
+    res.flushHeaders();
+    const nsKeep = setInterval(() => {
+      if (!res.writableEnded) res.write(" ");
+    }, 15_000);
+    req.on("close", () => clearInterval(nsKeep));
+    let fetchRes: any;
+    try {
+      fetchRes = await fetch(`${backend.url}/v1/chat/completions`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120_000),
+      });
+    } catch (e) {
+      clearInterval(nsKeep);
+      throw e;
+    }
+    clearInterval(nsKeep);
     if (!fetchRes.ok) {
       const errText = await fetchRes.text().catch(() => "unknown");
       throw new FriendProxyHttpError(fetchRes.status, `Friend proxy error ${fetchRes.status}: ${errText}`);
     }
     const json = await fetchRes.json() as Record<string, unknown>;
-    res.json(json);
+    res.end(JSON.stringify(json));
     const usage = json["usage"] as { prompt_tokens?: number; completion_tokens?: number } | null | undefined;
     if ((usage?.prompt_tokens ?? 0) === 0) {
       const inputChars = messages.reduce((acc, m) => {
@@ -1144,12 +1168,23 @@ async function handleOpenAI({
     res.end();
     return { promptTokens, completionTokens, ttftMs };
   } else {
-    const result = await client.chat.completions.create({ ...params, stream: false });
-    res.json(result);
-    return {
-      promptTokens: result.usage?.prompt_tokens ?? 0,
-      completionTokens: result.usage?.completion_tokens ?? 0,
-    };
+    // Non-streaming — HTTP keepalive to prevent Replit proxy 502 timeout
+    res.setHeader("Content-Type", "application/json");
+    res.flushHeaders();
+    const keepalive = setInterval(() => {
+      if (!res.writableEnded) res.write(" ");
+    }, 15_000);
+    req.on("close", () => clearInterval(keepalive));
+    try {
+      const result = await client.chat.completions.create({ ...params, stream: false });
+      res.end(JSON.stringify(result));
+      return {
+        promptTokens: result.usage?.prompt_tokens ?? 0,
+        completionTokens: result.usage?.completion_tokens ?? 0,
+      };
+    } finally {
+      clearInterval(keepalive);
+    }
   }
 }
 
@@ -1295,56 +1330,69 @@ async function handleClaude({
     }
 
   } else {
-    // Non-streaming — internally use stream().finalMessage() to avoid Replit's 10-min timeout
-    const result = await client.messages.stream(buildCreateParams() as Parameters<typeof client.messages.stream>[0]).finalMessage();
+    // Non-streaming — use internal streaming + HTTP keepalive to prevent Replit proxy 502 timeout.
+    // Leading whitespace is valid in JSON and ignored by JSON.parse.
+    res.setHeader("Content-Type", "application/json");
+    res.flushHeaders();
+    const keepalive = setInterval(() => {
+      if (!res.writableEnded) res.write(" ");
+    }, 15_000);
+    req.on("close", () => clearInterval(keepalive));
 
-    const textParts: string[] = [];
-    const toolCalls: OAIToolCall[] = [];
+    try {
+      const result = await client.messages.stream(buildCreateParams() as Parameters<typeof client.messages.stream>[0]).finalMessage();
 
-    for (const block of result.content) {
-      if (block.type === "thinking") {
-        textParts.push(`<thinking>\n${(block as { type: "thinking"; thinking: string }).thinking}\n</thinking>`);
-      } else if (block.type === "text") {
-        textParts.push((block as { type: "text"; text: string }).text);
-      } else if (block.type === "tool_use") {
-        const toolBlock = block as { type: "tool_use"; id: string; name: string; input: unknown };
-        toolCalls.push({
-          id: toolBlock.id,
-          type: "function",
-          function: {
-            name: toolBlock.name,
-            arguments: JSON.stringify(toolBlock.input),
-          },
-        });
+      const textParts: string[] = [];
+      const toolCalls: OAIToolCall[] = [];
+
+      for (const block of result.content) {
+        if (block.type === "thinking") {
+          textParts.push(`<thinking>\n${(block as { type: "thinking"; thinking: string }).thinking}\n</thinking>`);
+        } else if (block.type === "text") {
+          textParts.push((block as { type: "text"; text: string }).text);
+        } else if (block.type === "tool_use") {
+          const toolBlock = block as { type: "tool_use"; id: string; name: string; input: unknown };
+          toolCalls.push({
+            id: toolBlock.id,
+            type: "function",
+            function: {
+              name: toolBlock.name,
+              arguments: JSON.stringify(toolBlock.input),
+            },
+          });
+        }
       }
-    }
 
-    const text = textParts.join("\n\n");
-    const stopReason = result.stop_reason;
-    const finishReason = mapStopReason(stopReason);
+      const text = textParts.join("\n\n");
+      const stopReason = result.stop_reason;
+      const finishReason = mapStopReason(stopReason);
 
-    res.json({
-      id: result.id,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        message: {
-          role: "assistant",
-          content: text || null,
-          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+      const body = JSON.stringify({
+        id: result.id,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: text || null,
+            ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+          },
+          finish_reason: finishReason,
+        }],
+        usage: {
+          prompt_tokens: result.usage.input_tokens,
+          completion_tokens: result.usage.output_tokens,
+          total_tokens: result.usage.input_tokens + result.usage.output_tokens,
+          ...((result.usage as Record<string, number>).cache_read_input_tokens > 0 ? { prompt_tokens_details: { cached_tokens: (result.usage as Record<string, number>).cache_read_input_tokens } } : {}),
         },
-        finish_reason: finishReason,
-      }],
-      usage: {
-        prompt_tokens: result.usage.input_tokens,
-        completion_tokens: result.usage.output_tokens,
-        total_tokens: result.usage.input_tokens + result.usage.output_tokens,
-        ...((result.usage as Record<string, number>).cache_read_input_tokens > 0 ? { prompt_tokens_details: { cached_tokens: (result.usage as Record<string, number>).cache_read_input_tokens } } : {}),
-      },
-    });
-    return { promptTokens: result.usage.input_tokens, completionTokens: result.usage.output_tokens };
+      });
+      res.end(body);
+      return { promptTokens: result.usage.input_tokens, completionTokens: result.usage.output_tokens };
+    } finally {
+      clearInterval(keepalive);
+    }
   }
 }
 
