@@ -61,4 +61,14 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use("/api", router);
 app.use(proxyRouter);
 
+// Serve the portal frontend (built by vite) when available
+const portalDist = resolve(process.cwd(), "../api-portal/dist/public");
+if (existsSync(portalDist)) {
+  app.use(express.static(portalDist));
+  // SPA fallback: serve index.html for any non-API route
+  app.get("*", (_req: Request, res: Response) => {
+    res.sendFile(resolve(portalDist, "index.html"));
+  });
+}
+
 export default app;
