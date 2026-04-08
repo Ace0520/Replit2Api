@@ -1003,7 +1003,7 @@ async function handleFriendProxy({
         method: "POST",
         headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120_000),
+        signal: AbortSignal.timeout(600_000),
       });
     } catch (e) {
       clearInterval(nsKeep);
@@ -1049,7 +1049,7 @@ async function handleFriendProxy({
       method: "POST",
       headers: { Authorization: `Bearer ${backend.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(600_000),
     });
 
     if (!fetchRes.ok) {
