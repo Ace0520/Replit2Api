@@ -1,6 +1,6 @@
 {
-  "version": "1.2.1",
+  "version": "1.2.2",
   "name": "Replit2Api",
-  "releaseDate": "2026-04-07",
-  "releaseNotes": "v1.2.1 — Fix duplicate message_stop causing client SDK error; complete stop_reason→finish_reason mapping (end_turn/max_tokens/stop_sequence); system-only messages fallback; writableEnded guard for /v1/messages streaming; cache token stats (prompt_tokens_details); SSE headers consistency; defensive base64 data URL parsing"
+  "releaseDate": "2026-04-08",
+  "releaseNotes": "v1.2.2 — Fix non-streaming 502 timeout on Replit (HTTP keepalive for Claude/OpenAI/FriendProxy); SetupWizard aligned with upstream (4 providers + programmatic AI Integrations + in-wizard key input); api-server serves portal static files for single-port deployment"
 }

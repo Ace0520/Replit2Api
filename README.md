@@ -6,7 +6,7 @@
 >
 > 一个 Replit 项目，统一接入主流 AI 服务商，提供 OpenAI 兼容接口。
 
-[![Version](https://img.shields.io/badge/version-1.2.1-6366f1?style=flat-square)](./version.json)
+[![Version](https://img.shields.io/badge/version-1.2.2-6366f1?style=flat-square)](./version.json)
 [![Replit](https://img.shields.io/badge/Replit-Remix%20now-f26207?style=flat-square&logo=replit)](https://replit.com/@1400747468/Replit-Api-Public)
 [![License](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)](./LICENSE)
 [![Forked from](https://img.shields.io/badge/forked%20from-Akatsuki03%2FReplit2Api-8b5cf6?style=flat-square&logo=github)](https://github.com/Akatsuki03/Replit2Api)
@@ -296,6 +296,18 @@ Manage multiple Replit2Api instances from the **Stats & Nodes** tab:
 ---
 
 ## 更新日志 · Changelog
+
+### v1.2.2 — 2026-04-08
+
+- **修复非流式 502 超时**：Claude/OpenAI/FriendProxy 非流式请求添加 HTTP keepalive，每 15 秒发送前导空格保持连接活跃，防止 Replit 反向代理 ~60s 空闲超时
+- **配置助手对齐原仓库**：支持 4 个 AI 提供商的编程式 AI Integrations 配置 + 向导内 API Key 输入
+- **单端口部署**：api-server 可同时 serve portal 前端静态文件
+- **一键部署链接更新**：指向 @1400747468/Replit-Api-Public
+
+- **Fix non-streaming 502**: HTTP keepalive (whitespace every 15s) for Claude/OpenAI/FriendProxy non-streaming paths, preventing Replit proxy idle timeout
+- **SetupWizard aligned with upstream**: 4 AI providers with programmatic AI Integrations + in-wizard API key input
+- **Single-port deployment**: api-server can serve portal static files
+- **One-click deploy link updated**: now points to @1400747468/Replit-Api-Public
 
 ### v1.2.1 — 2026-04-07
 
